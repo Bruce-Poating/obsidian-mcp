@@ -35,10 +35,7 @@ pub fn extract_raw_frontmatter(content: &str) -> Option<(&str, usize)> {
             return Some((yaml_str, body_start));
         }
 
-        match line_end {
-            Some(end) => pos += end + 1,
-            None => return None,
-        }
+        pos += line_end? + 1;
     }
 }
 

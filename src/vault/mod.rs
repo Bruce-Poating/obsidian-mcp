@@ -336,6 +336,14 @@ impl Vault {
         if fs::file_exists(&self.inner.root, path) {
             return Err(VaultError::AlreadyExists(path.to_path_buf()));
         }
+        if let Some(value) = frontmatter
+            && !value.is_object()
+        {
+            return Err(VaultError::InvalidFrontmatter {
+                path: path.to_path_buf(),
+                actual: frontmatter::json_type_name(value),
+            });
+        }
         let full_content = frontmatter::rebuild_content(frontmatter, content);
         let actual_path = fs::write_file(&self.inner.root, path, &full_content)?;
         self.reindex(&actual_path)?;
@@ -1368,6 +1376,37 @@ mod tests {
         let content = vault.read_note(Path::new("fm.md")).unwrap();
         assert!(content.starts_with("---\n"));
         assert!(content.contains("Body\n"));
+    }
+
+    #[tokio::test]
+    async fn vault_create_note_rejects_non_object_frontmatter_without_writing() {
+        let dir = tempfile::tempdir().unwrap();
+        create_test_vault(dir.path());
+        let vault = Vault::open(&test_config(dir.path())).await.unwrap();
+
+        for (path, frontmatter, actual) in [
+            ("array.md", serde_json::json!(["rust", "mcp"]), "array"),
+            ("string.md", serde_json::json!("{\"draft\":true}"), "string"),
+            ("null.md", serde_json::Value::Null, "null"),
+        ] {
+            let err = vault
+                .create_note(Path::new(path), "body", Some(&frontmatter))
+                .unwrap_err();
+            assert!(
+                matches!(
+                    &err,
+                    VaultError::InvalidFrontmatter {
+                        path: error_path,
+                        actual: error_actual
+                    } if error_path == Path::new(path) && *error_actual == actual
+                ),
+                "unexpected error for '{path}': {err:?}"
+            );
+            assert!(!dir.path().join(path).exists());
+
+            let error_data: rmcp::ErrorData = err.into();
+            assert_eq!(error_data.code, rmcp::model::ErrorCode::INVALID_PARAMS);
+        }
     }
 
     #[tokio::test]

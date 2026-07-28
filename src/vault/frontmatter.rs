@@ -77,7 +77,7 @@ pub fn parse_frontmatter(content: &str) -> VaultResult<Option<serde_json::Value>
     }
 }
 
-fn json_type_name(value: &serde_json::Value) -> &'static str {
+pub(crate) fn json_type_name(value: &serde_json::Value) -> &'static str {
     match value {
         serde_json::Value::Array(_) => "array",
         serde_json::Value::String(_) => "string",

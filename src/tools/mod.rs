@@ -21,6 +21,55 @@ use crate::client::semantic_daemon::SemanticDaemonClient;
 use crate::config::SemanticMode;
 use crate::vault::Vault;
 
+/// JSON Schema for a value that may be any JSON type.
+///
+/// `serde_json::Value` deliberately emits an unconstrained schema in Schemars,
+/// so tool inputs need this explicit schema to prevent clients from guessing
+/// that structured values should be JSON-encoded strings.
+pub(crate) fn json_value_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["array", "boolean", "null", "number", "object", "string"]
+    })
+}
+
+/// JSON Schema for an optional object-valued tool input.
+pub(crate) fn json_object_schema(_generator: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({
+        "type": ["object", "null"],
+        "additionalProperties": true
+    })
+}
+
+/// Deserialize an optional dynamic JSON field while preserving explicit null.
+///
+/// Serde normally maps both a missing `Option<Value>` and an explicit JSON
+/// `null` to `None`. The tool handlers need to distinguish those cases because
+/// null is a valid frontmatter value.
+pub(crate) fn deserialize_optional_json_value<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    <serde_json::Value as serde::Deserialize>::deserialize(deserializer).map(Some)
+}
+
+/// Deserialize an optional object-valued input and reject every other JSON type.
+pub(crate) fn deserialize_optional_json_object<'de, D>(
+    deserializer: D,
+) -> Result<Option<serde_json::Value>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let value = <Option<serde_json::Value> as serde::Deserialize>::deserialize(deserializer)?;
+    match value {
+        Some(serde_json::Value::Object(_)) | None => Ok(value),
+        Some(_) => Err(<D::Error as serde::de::Error>::custom(
+            "expected a JSON object or null",
+        )),
+    }
+}
+
 #[derive(Clone)]
 pub struct SemanticRuntime {
     pub mode: SemanticMode,
@@ -309,6 +358,8 @@ mod tests {
     use crate::config::ALL_TOOL_NAMES;
     use crate::test_helpers::{create_test_vault, test_config};
     use crate::vault::Vault;
+    use rmcp::ServiceExt;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 
     fn test_runtime() -> SemanticRuntime {
         SemanticRuntime {
@@ -371,5 +422,118 @@ mod tests {
                 "expected tool '{name}' to be disabled"
             );
         }
+    }
+
+    #[tokio::test]
+    async fn frontmatter_tool_inputs_publish_explicit_json_types() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
+
+        let input_schema = |name: &str| {
+            let tool = server
+                .tool_router
+                .get(name)
+                .unwrap_or_else(|| panic!("missing tool '{name}'"));
+            serde_json::Value::Object(tool.input_schema.as_ref().clone())
+        };
+
+        let note_create = input_schema("note_create");
+        assert_eq!(
+            note_create.pointer("/properties/frontmatter/type"),
+            Some(&serde_json::json!(["object", "null"]))
+        );
+        assert_eq!(
+            note_create.pointer("/properties/frontmatter/additionalProperties"),
+            Some(&serde_json::json!(true))
+        );
+
+        let dynamic_types =
+            serde_json::json!(["array", "boolean", "null", "number", "object", "string"]);
+        for tool_name in ["frontmatter", "search_metadata"] {
+            let schema = input_schema(tool_name);
+            assert_eq!(
+                schema.pointer("/properties/value/type"),
+                Some(&dynamic_types),
+                "unexpected value schema for '{tool_name}'"
+            );
+            assert!(
+                !schema["required"]
+                    .as_array()
+                    .is_some_and(|required| required.contains(&serde_json::json!("value"))),
+                "'value' must remain optional for '{tool_name}'"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn note_create_rejects_stringified_frontmatter_before_writing() {
+        let tmp = tempfile::tempdir().unwrap();
+        create_test_vault(tmp.path());
+        let vault = Vault::open(&test_config(tmp.path())).await.unwrap();
+        let server = ObsidianMcp::new(vault, 0.25, test_runtime(), HashSet::new());
+
+        let (server_transport, client_transport) = tokio::io::duplex(4096);
+        let server_handle = tokio::spawn(async move {
+            server
+                .serve(server_transport)
+                .await
+                .unwrap()
+                .waiting()
+                .await
+                .unwrap();
+        });
+        let (client_read, mut client_write) = tokio::io::split(client_transport);
+        let mut client_lines = BufReader::new(client_read).lines();
+
+        let mut initialize = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "initialize",
+            "params": {
+                "protocolVersion": "2025-11-25",
+                "capabilities": {},
+                "clientInfo": {"name": "test-client", "version": "0.0.1"}
+            }
+        }))
+        .unwrap();
+        initialize.push(b'\n');
+        client_write.write_all(&initialize).await.unwrap();
+        let _initialize_response = client_lines.next_line().await.unwrap().unwrap();
+
+        let mut initialized = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "method": "notifications/initialized"
+        }))
+        .unwrap();
+        initialized.push(b'\n');
+        client_write.write_all(&initialized).await.unwrap();
+
+        let mut call = serde_json::to_vec(&serde_json::json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "tools/call",
+            "params": {
+                "name": "note_create",
+                "arguments": {
+                    "path": "invalid.md",
+                    "content": "body",
+                    "frontmatter": "{\"tags\":[\"rust\",\"mcp\"]}"
+                }
+            }
+        }))
+        .unwrap();
+        call.push(b'\n');
+        client_write.write_all(&call).await.unwrap();
+
+        let response: serde_json::Value =
+            serde_json::from_str(&client_lines.next_line().await.unwrap().unwrap()).unwrap();
+        assert_eq!(response["error"]["code"], -32602);
+        assert!(!tmp.path().join("invalid.md").exists());
+
+        client_write.shutdown().await.unwrap();
+        drop(client_lines);
+        server_handle.await.unwrap();
     }
 }

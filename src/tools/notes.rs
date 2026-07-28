@@ -26,7 +26,11 @@ pub struct NoteCreateParams {
     #[serde(default)]
     pub content: Option<String>,
     /// Optional YAML frontmatter as a JSON object (e.g. `{"tags": ["rust"], "draft": true}`).
-    #[serde(default)]
+    #[serde(
+        default,
+        deserialize_with = "crate::tools::deserialize_optional_json_object"
+    )]
+    #[schemars(schema_with = "crate::tools::json_object_schema")]
     pub frontmatter: Option<serde_json::Value>,
 }
 
@@ -211,21 +215,54 @@ mod tests {
         create_test_vault(dir.path());
         let vault = Vault::open(&test_config(dir.path())).await.unwrap();
 
-        let msg = note_create(
-            &vault,
-            NoteCreateParams {
-                path: "new.md".into(),
-                content: Some("body".into()),
-                frontmatter: Some(serde_json::json!({"status": "draft"})),
-            },
-        )
-        .await
+        let params: NoteCreateParams = serde_json::from_value(serde_json::json!({
+            "path": "new.md",
+            "content": "body",
+            "frontmatter": {
+                "status": "draft",
+                "tags": ["rust", "mcp"],
+                "published": false
+            }
+        }))
         .unwrap();
+        let msg = note_create(&vault, params).await.unwrap();
         assert!(msg.contains("new.md"));
 
         let content = vault.read_note(Path::new("new.md")).unwrap();
-        assert!(content.contains("body"));
-        assert!(content.contains("status"));
+        let frontmatter = crate::vault::frontmatter::parse_frontmatter(&content)
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            frontmatter,
+            serde_json::json!({
+                "status": "draft",
+                "tags": ["rust", "mcp"],
+                "published": false
+            })
+        );
+        assert_eq!(crate::vault::frontmatter::get_body(&content), "body");
+    }
+
+    #[test]
+    fn create_params_reject_non_object_frontmatter() {
+        for frontmatter in [
+            serde_json::json!(["rust", "mcp"]),
+            serde_json::json!("{\"tags\":[\"rust\",\"mcp\"]}"),
+            serde_json::json!("[\"rust\",\"mcp\"]"),
+        ] {
+            let result = serde_json::from_value::<NoteCreateParams>(serde_json::json!({
+                "path": "new.md",
+                "frontmatter": frontmatter
+            }));
+            assert!(result.is_err());
+        }
+
+        let params = serde_json::from_value::<NoteCreateParams>(serde_json::json!({
+            "path": "new.md",
+            "frontmatter": null
+        }))
+        .unwrap();
+        assert!(params.frontmatter.is_none());
     }
 
     #[tokio::test]

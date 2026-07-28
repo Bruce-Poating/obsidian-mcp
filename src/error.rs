@@ -21,6 +21,9 @@ pub enum VaultError {
         source: serde_yaml::Error,
     },
 
+    #[error("Invalid frontmatter for {path}: expected a JSON object, got {actual}")]
+    InvalidFrontmatter { path: PathBuf, actual: &'static str },
+
     #[error("IO error: {0}")]
     Io(#[from] std::io::Error),
 
@@ -89,6 +92,7 @@ impl From<VaultError> for rmcp::ErrorData {
             VaultError::InvalidPath(_)
             | VaultError::OutsideVault(_)
             | VaultError::AlreadyExists(_)
+            | VaultError::InvalidFrontmatter { .. }
             | VaultError::PatchTargetNotFound { .. }
             | VaultError::InvalidRegex { .. } => ErrorCode::INVALID_PARAMS,
             VaultError::FrontmatterParse { .. } => ErrorCode::PARSE_ERROR,

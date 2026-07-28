@@ -129,8 +129,14 @@ pub struct SearchMetadataParams {
     /// Frontmatter field name to query. Required when type is `"frontmatter"`.
     #[serde(default)]
     pub field: Option<String>,
-    /// Value to compare against. Required for `eq` and `contains` operators; ignored for `exists`. Only used when type is `"frontmatter"`.
-    #[serde(default)]
+    /// Value to compare against. Required for `eq` and `contains` operators;
+    /// ignored for `exists`. Pass arrays and objects directly; a JSON-encoded
+    /// string is compared as a literal string. Only used when type is `"frontmatter"`.
+    #[serde(
+        default,
+        deserialize_with = "crate::tools::deserialize_optional_json_value"
+    )]
+    #[schemars(schema_with = "crate::tools::json_value_schema")]
     pub value: Option<serde_json::Value>,
     /// Comparison operator (default: `eq`). Only used when type is `"frontmatter"`.
     #[serde(default)]
@@ -1114,6 +1120,40 @@ mod tests {
         .await;
 
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn search_metadata_preserves_and_matches_explicit_null_value() {
+        let missing: SearchMetadataParams = serde_json::from_value(serde_json::json!({
+            "type": "frontmatter",
+            "field": "status"
+        }))
+        .unwrap();
+        assert!(missing.value.is_none());
+
+        let explicit_null: SearchMetadataParams = serde_json::from_value(serde_json::json!({
+            "type": "frontmatter",
+            "field": "status",
+            "value": null
+        }))
+        .unwrap();
+        assert_eq!(explicit_null.value, Some(serde_json::Value::Null));
+
+        let (_dir, vault) = setup_search_vault().await;
+        vault
+            .set_frontmatter_field(Path::new("rust.md"), "reviewed_at", serde_json::Value::Null)
+            .unwrap();
+        let params: SearchMetadataParams = serde_json::from_value(serde_json::json!({
+            "type": "frontmatter",
+            "field": "reviewed_at",
+            "operator": "eq",
+            "value": null
+        }))
+        .unwrap();
+        let result = search_metadata(&vault, params).await.unwrap();
+        let parsed: Vec<serde_json::Value> = serde_json::from_str(extract_text(&result)).unwrap();
+        assert_eq!(parsed.len(), 1);
+        assert_eq!(parsed[0]["path"], "rust.md");
     }
 
     #[tokio::test]

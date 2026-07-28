@@ -102,7 +102,13 @@ pub struct FrontmatterParams {
     pub path: String,
     /// Frontmatter key. Required for `"set"` and `"remove"` actions.
     pub key: Option<String>,
-    /// JSON value to assign. Required for `"set"` action.
+    /// JSON value to assign. Required for `"set"` action. Pass arrays and objects
+    /// directly; a JSON-encoded string is stored as a literal string.
+    #[serde(
+        default,
+        deserialize_with = "crate::tools::deserialize_optional_json_value"
+    )]
+    #[schemars(schema_with = "crate::tools::json_value_schema")]
     pub value: Option<serde_json::Value>,
 }
 
@@ -432,6 +438,37 @@ mod tests {
         assert_eq!(fm["status"], "draft");
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
 
+        for (key, value) in [
+            ("empty", serde_json::Value::Null),
+            ("literal_json", serde_json::json!("[\"rust\",\"mcp\"]")),
+        ] {
+            frontmatter(
+                &vault,
+                FrontmatterParams {
+                    action: "set".into(),
+                    path: "fm.md".into(),
+                    key: Some(key.into()),
+                    value: Some(value),
+                },
+            )
+            .await
+            .unwrap();
+        }
+
+        let result = frontmatter(
+            &vault,
+            FrontmatterParams {
+                action: "get".into(),
+                path: "fm.md".into(),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+        let fm = result.structured_content.unwrap();
+        assert_eq!(fm["empty"], serde_json::Value::Null);
+        assert_eq!(fm["literal_json"], "[\"rust\",\"mcp\"]");
+
         frontmatter(
             &vault,
             FrontmatterParams {
@@ -457,6 +494,44 @@ mod tests {
         let fm = result.structured_content.unwrap();
         assert!(fm.get("status").is_none());
         assert_eq!(fm["tags"], serde_json::json!(["rust", "mcp"]));
+    }
+
+    #[test]
+    fn frontmatter_params_preserve_missing_null_and_literal_strings() {
+        let missing: FrontmatterParams = serde_json::from_value(serde_json::json!({
+            "action": "set",
+            "path": "fm.md",
+            "key": "value"
+        }))
+        .unwrap();
+        assert!(missing.value.is_none());
+
+        let explicit_null: FrontmatterParams = serde_json::from_value(serde_json::json!({
+            "action": "set",
+            "path": "fm.md",
+            "key": "value",
+            "value": null
+        }))
+        .unwrap();
+        assert_eq!(explicit_null.value, Some(serde_json::Value::Null));
+
+        let array: FrontmatterParams = serde_json::from_value(serde_json::json!({
+            "action": "set",
+            "path": "fm.md",
+            "key": "value",
+            "value": ["rust", "mcp"]
+        }))
+        .unwrap();
+        assert_eq!(array.value, Some(serde_json::json!(["rust", "mcp"])));
+
+        let literal: FrontmatterParams = serde_json::from_value(serde_json::json!({
+            "action": "set",
+            "path": "fm.md",
+            "key": "value",
+            "value": "[\"rust\",\"mcp\"]"
+        }))
+        .unwrap();
+        assert_eq!(literal.value, Some(serde_json::json!("[\"rust\",\"mcp\"]")));
     }
 
     #[tokio::test]

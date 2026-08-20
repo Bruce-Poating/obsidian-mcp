@@ -176,9 +176,20 @@ async fn health_handler(vault: Vault) -> axum::Json<serde_json::Value> {
 
     #[cfg(has_embeddings)]
     {
-        let embeddings_ready = vault.has_embeddings();
-        resp["embeddings_ready"] = serde_json::json!(embeddings_ready);
-        if let Some(err) = vault.embedding_load_error() {
+        let status = vault.embedding_status();
+        resp["embeddings_ready"] =
+            serde_json::json!(status.as_ref().is_some_and(|status| status.queryable));
+        if let Some(status) = &status {
+            resp["embeddings_phase"] = serde_json::json!(status.phase);
+            resp["embeddings_indexed_notes"] = serde_json::json!(status.indexed_notes);
+            resp["embeddings_total_notes"] = serde_json::json!(status.total_notes);
+            resp["embeddings_pending_notes"] = serde_json::json!(status.pending_notes);
+        }
+        if let Some(err) = status
+            .as_ref()
+            .and_then(|status| status.last_error.as_deref())
+            .or_else(|| vault.embedding_load_error())
+        {
             resp["embeddings_error"] = serde_json::json!(err);
         }
     }
@@ -208,8 +219,6 @@ async fn shutdown_signal() {
 
 struct InitializedDaemonClient {
     client: SemanticDaemonClient,
-    #[cfg(has_embeddings)]
-    semantic_home: Option<PathBuf>,
 }
 
 async fn init_semantic_runtime(
@@ -235,36 +244,6 @@ async fn init_semantic_runtime(
 
     match initialize_daemon_client(runtime_cfg).await {
         Ok(initialized) => {
-            #[cfg(has_embeddings)]
-            if let Some(semantic_home) = initialized.semantic_home.as_deref() {
-                match obsidian_mcp::vault::embeddings::migrate_legacy_cache_to_daemon_store(
-                    &config.vault_path,
-                    semantic_home,
-                ) {
-                    Ok(obsidian_mcp::vault::embeddings::LegacyCacheMigration::Migrated(path)) => {
-                        tracing::info!(
-                            path = %path.display(),
-                            "migrated legacy local embedding cache into daemon namespace store"
-                        );
-                    }
-                    Ok(obsidian_mcp::vault::embeddings::LegacyCacheMigration::AlreadyPresent(
-                        path,
-                    )) => {
-                        tracing::debug!(
-                            path = %path.display(),
-                            "daemon embedding cache already present; skipping legacy cache migration"
-                        );
-                    }
-                    Ok(obsidian_mcp::vault::embeddings::LegacyCacheMigration::NotFound) => {}
-                    Err(err) => {
-                        tracing::warn!(
-                            error = %err,
-                            "failed to migrate legacy embedding cache to daemon namespace"
-                        );
-                    }
-                }
-            }
-
             runtime.daemon_client = Some(initialized.client);
         }
         Err(err) => {
@@ -298,8 +277,6 @@ async fn initialize_daemon_client(
     let initialized = if let Some(raw_endpoint) = runtime_cfg.daemon_endpoint_override.as_deref() {
         InitializedDaemonClient {
             client: SemanticDaemonClient::new(endpoint_from_override(raw_endpoint), policy),
-            #[cfg(has_embeddings)]
-            semantic_home: None,
         }
     } else {
         let bootstrap_result = ensure_daemon(&BootstrapConfig {
@@ -313,8 +290,6 @@ async fn initialize_daemon_client(
         .await?;
         InitializedDaemonClient {
             client: SemanticDaemonClient::new(bootstrap_result.endpoint, policy),
-            #[cfg(has_embeddings)]
-            semantic_home: Some(bootstrap_result.semantic_home),
         }
     };
 

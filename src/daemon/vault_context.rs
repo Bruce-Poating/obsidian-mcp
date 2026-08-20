@@ -12,11 +12,16 @@ use crate::vault::index::VaultIndex;
 use crate::vault::tantivy_index::TantivyIndex;
 
 #[cfg(has_embeddings)]
-use crate::vault::embeddings::{EmbeddingModel, EmbeddingStore};
+use crate::vault::embedding_runtime::{EmbeddingRuntime, EmbeddingRuntimeStatus};
+#[cfg(has_embeddings)]
+use crate::vault::embeddings::Embedder;
+
+use super::watcher;
 
 #[cfg(has_embeddings)]
-use super::indexer;
-use super::watcher;
+pub(crate) type EmbeddingLoaderFuture = std::pin::Pin<
+    Box<dyn std::future::Future<Output = VaultResult<Arc<dyn Embedder>>> + Send + 'static>,
+>;
 
 pub struct VaultContext {
     vault_id: String,
@@ -25,22 +30,18 @@ pub struct VaultContext {
     index: Arc<RwLock<VaultIndex>>,
     tantivy: Arc<TantivyIndex>,
     #[cfg(has_embeddings)]
-    embedding_model: Arc<EmbeddingModel>,
-    #[cfg(has_embeddings)]
-    embedding_store: Arc<RwLock<EmbeddingStore>>,
-    #[cfg(has_embeddings)]
-    embedding_cache_path: PathBuf,
+    embedding_runtime: EmbeddingRuntime,
     watcher: Mutex<Option<Debouncer<notify::RecommendedWatcher>>>,
 }
 
 impl VaultContext {
-    pub async fn open(
+    pub(crate) async fn open(
         vault_id: String,
         vault_root: PathBuf,
         model_name: String,
         state_dir: PathBuf,
         watch_enabled: bool,
-        #[cfg(has_embeddings)] embedding_model: Arc<EmbeddingModel>,
+        #[cfg(has_embeddings)] embedding_loader: EmbeddingLoaderFuture,
     ) -> VaultResult<Self> {
         std::fs::create_dir_all(&state_dir)?;
 
@@ -56,16 +57,24 @@ impl VaultContext {
         let tantivy = Arc::new(tantivy);
 
         #[cfg(has_embeddings)]
-        let (embedding_store, embedding_cache_path) = {
-            let embedding_cache_path = state_dir.join("embeddings.bin");
-            let store = indexer::build_or_load_embeddings(
-                &vault_root,
-                &index,
-                &embedding_model,
-                &embedding_cache_path,
-            )?;
-            let store = Arc::new(RwLock::new(store));
-            (store, embedding_cache_path)
+        let embedding_runtime = {
+            let cache_migration_sources = vec![
+                vault_root
+                    .join(".obsidian-mcp")
+                    .join("embeddings")
+                    .join("embeddings.bin"),
+                vault_root
+                    .join(".obsidian")
+                    .join("obsidian-mcp")
+                    .join("embeddings.bin"),
+            ];
+            EmbeddingRuntime::spawn_with_cache_sources(
+                vault_root.clone(),
+                Arc::clone(&index),
+                state_dir.join("embeddings.bin"),
+                cache_migration_sources,
+                embedding_loader,
+            )
         };
 
         let context = Self {
@@ -75,11 +84,7 @@ impl VaultContext {
             index,
             tantivy,
             #[cfg(has_embeddings)]
-            embedding_model,
-            #[cfg(has_embeddings)]
-            embedding_store,
-            #[cfg(has_embeddings)]
-            embedding_cache_path,
+            embedding_runtime,
             watcher: Mutex::new(None),
         };
 
@@ -125,9 +130,7 @@ impl VaultContext {
             self.vault_root.clone(),
             Arc::clone(&self.index),
             Some(Arc::clone(&self.tantivy)),
-            Arc::clone(&self.embedding_model),
-            Arc::clone(&self.embedding_store),
-            self.embedding_cache_path.clone(),
+            self.embedding_runtime.clone(),
             Arc::new(ExcludeSet::build(vec![])?),
         )?;
 
@@ -174,29 +177,51 @@ impl VaultContext {
         query: &str,
         top_k: usize,
     ) -> VaultResult<Vec<(PathBuf, f32)>> {
-        let query_vec = self.embedding_model.embed_one(query)?;
-        let guard = self.embedding_store.read().map_err(|err| {
-            VaultError::Other(format!("daemon embedding store lock poisoned: {err}"))
-        })?;
-        Ok(guard.query(&query_vec, top_k))
+        let current_paths = self
+            .index
+            .read()
+            .map_err(|error| VaultError::Other(format!("daemon index lock poisoned: {error}")))?
+            .notes()
+            .keys()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        self.embedding_runtime
+            .query_snapshot()?
+            .semantic_scores_for_paths(query, &current_paths, top_k)
     }
 
     #[cfg(has_embeddings)]
-    pub fn query_embedding(&self, query: &str) -> VaultResult<Vec<f32>> {
-        self.embedding_model.embed_one(query)
-    }
-
-    #[cfg(has_embeddings)]
-    pub fn semantic_score_for(&self, path: &Path, query_embedding: &[f32]) -> VaultResult<f32> {
-        let guard = self.embedding_store.read().map_err(|err| {
-            VaultError::Other(format!("daemon embedding store lock poisoned: {err}"))
-        })?;
-        Ok(guard
-            .get(path)
-            .map(|embedding| {
-                crate::vault::embeddings::cosine_similarity(query_embedding, embedding)
+    pub fn search_hybrid_scores(
+        &self,
+        query: &str,
+        bm25_hits: &[(PathBuf, f32)],
+        alpha: f32,
+        top_k: usize,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
+        let snapshot = self.embedding_runtime.query_snapshot()?;
+        let query_embedding = snapshot.embed_query(query)?;
+        let normalized = crate::vault::search_utils::normalize_bm25_scores(bm25_hits);
+        let mut combined = normalized
+            .into_iter()
+            .map(|(path, normalized_bm25)| {
+                let semantic = snapshot.score_for(&path, &query_embedding);
+                let score = alpha * normalized_bm25 + (1.0 - alpha) * semantic;
+                (path, score)
             })
-            .unwrap_or(0.0))
+            .collect::<Vec<_>>();
+        combined.sort_unstable_by(|left, right| {
+            right
+                .1
+                .partial_cmp(&left.1)
+                .unwrap_or(std::cmp::Ordering::Equal)
+        });
+        combined.truncate(top_k);
+        Ok(combined)
+    }
+
+    #[cfg(has_embeddings)]
+    pub fn embedding_status(&self) -> EmbeddingRuntimeStatus {
+        self.embedding_runtime.status()
     }
 
     #[cfg(not(has_embeddings))]
@@ -211,14 +236,13 @@ impl VaultContext {
     }
 
     #[cfg(not(has_embeddings))]
-    pub fn query_embedding(&self, _query: &str) -> VaultResult<Vec<f32>> {
-        Err(VaultError::Embedding(
-            "daemon binary compiled without embeddings feature".to_string(),
-        ))
-    }
-
-    #[cfg(not(has_embeddings))]
-    pub fn semantic_score_for(&self, _path: &Path, _query_embedding: &[f32]) -> VaultResult<f32> {
+    pub fn search_hybrid_scores(
+        &self,
+        _query: &str,
+        _bm25_hits: &[(PathBuf, f32)],
+        _alpha: f32,
+        _top_k: usize,
+    ) -> VaultResult<Vec<(PathBuf, f32)>> {
         Err(VaultError::Embedding(
             "daemon binary compiled without embeddings feature".to_string(),
         ))

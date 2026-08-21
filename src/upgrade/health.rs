@@ -88,9 +88,7 @@ fn probe_address(
         match stream.read(&mut chunk) {
             Ok(0) => break,
             Ok(read) => response.extend_from_slice(&chunk[..read]),
-            Err(err)
-                if err.kind() == std::io::ErrorKind::ConnectionReset && !response.is_empty() =>
-            {
+            Err(err) if is_terminal_disconnect_after_response(&err, &response) => {
                 break;
             }
             Err(err) => return Err(err.into()),
@@ -120,6 +118,14 @@ fn probe_address(
     Ok(HealthObservation {
         version: body.version,
     })
+}
+
+fn is_terminal_disconnect_after_response(err: &std::io::Error, response: &[u8]) -> bool {
+    !response.is_empty()
+        && matches!(
+            err.kind(),
+            std::io::ErrorKind::ConnectionReset | std::io::ErrorKind::ConnectionAborted
+        )
 }
 
 fn format_host_header(host: &str, port: u16) -> String {
@@ -189,5 +195,21 @@ mod tests {
     fn host_header_brackets_ipv6_literals() {
         assert_eq!(format_host_header("::1", 37842), "[::1]:37842");
         assert_eq!(format_host_header("127.0.0.1", 37842), "127.0.0.1:37842");
+    }
+
+    #[test]
+    fn response_bytes_survive_terminal_disconnects() {
+        let response = b"HTTP/1.0 200 OK\r\n\r\n{}";
+        for kind in [
+            std::io::ErrorKind::ConnectionReset,
+            std::io::ErrorKind::ConnectionAborted,
+        ] {
+            let err = std::io::Error::from(kind);
+            assert!(is_terminal_disconnect_after_response(&err, response));
+            assert!(!is_terminal_disconnect_after_response(&err, &[]));
+        }
+
+        let timeout = std::io::Error::from(std::io::ErrorKind::TimedOut);
+        assert!(!is_terminal_disconnect_after_response(&timeout, response));
     }
 }

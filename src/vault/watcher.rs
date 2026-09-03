@@ -16,6 +16,7 @@ use notify_debouncer_mini::{DebounceEventResult, Debouncer, new_debouncer};
 use tokio::runtime::Handle;
 
 use super::exclude::ExcludeSet;
+use super::fs;
 use super::index::VaultIndex;
 use super::path as vault_path;
 use super::tantivy_index::TantivyIndex;
@@ -241,6 +242,21 @@ fn process_event(
 
     if is_excluded_path(exclude, &relative) {
         if absolute.exists() {
+        // unchanged-skip guard: size+mtime 短路（第二道防线，切断 read->event->reindex 自反馈）
+        // debouncer-mini 0.7 擦平 EventKind，读文件产生的 OPEN 与真实修改无法区分，
+        // 只能以文件签名 (size, modified) 判定是否有实质变化；签名未变则跳过（不读文件、不入队）。
+        let current_sig = fs::file_stat(vault_root, &relative).ok().map(|st| (st.size, st.modified));
+        let previous_sig = index
+            .read()
+            .ok()
+            .and_then(|idx| idx.get_note(&relative).map(|meta| (meta.stat.size, meta.stat.modified)));
+        if let (Some(cur), Some(prev)) = (current_sig, previous_sig)
+            && cur == prev
+        {
+            tracing::trace!(path = %relative.display(), "watcher event skipped: file signature unchanged");
+            return false;
+        }
+
             tracing::debug!(path = %relative.display(), "tracking excluded note");
             match index.write() {
                 Ok(mut idx) => idx.add_excluded_file(&relative),
@@ -274,6 +290,21 @@ fn process_event(
     }
 
     if absolute.exists() {
+        // unchanged-skip guard: size+mtime 短路（第二道防线，切断 read->event->reindex 自反馈）
+        // debouncer-mini 0.7 擦平 EventKind，读文件产生的 OPEN 与真实修改无法区分，
+        // 只能以文件签名 (size, modified) 判定是否有实质变化；签名未变则跳过（不读文件、不入队）。
+        let current_sig = fs::file_stat(vault_root, &relative).ok().map(|st| (st.size, st.modified));
+        let previous_sig = index
+            .read()
+            .ok()
+            .and_then(|idx| idx.get_note(&relative).map(|meta| (meta.stat.size, meta.stat.modified)));
+        if let (Some(cur), Some(prev)) = (current_sig, previous_sig)
+            && cur == prev
+        {
+            tracing::trace!(path = %relative.display(), "watcher event skipped: file signature unchanged");
+            return false;
+        }
+
         tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
         let meta = match index.write() {
             Ok(mut idx) => {
@@ -344,6 +375,21 @@ fn process_event(
 
     if is_excluded_path(exclude, &relative) {
         if absolute.exists() {
+        // unchanged-skip guard: size+mtime 短路（第二道防线，切断 read->event->reindex 自反馈）
+        // debouncer-mini 0.7 擦平 EventKind，读文件产生的 OPEN 与真实修改无法区分，
+        // 只能以文件签名 (size, modified) 判定是否有实质变化；签名未变则跳过（不读文件、不入队）。
+        let current_sig = fs::file_stat(vault_root, &relative).ok().map(|st| (st.size, st.modified));
+        let previous_sig = index
+            .read()
+            .ok()
+            .and_then(|idx| idx.get_note(&relative).map(|meta| (meta.stat.size, meta.stat.modified)));
+        if let (Some(cur), Some(prev)) = (current_sig, previous_sig)
+            && cur == prev
+        {
+            tracing::trace!(path = %relative.display(), "watcher event skipped: file signature unchanged");
+            return false;
+        }
+
             tracing::debug!(path = %relative.display(), "tracking excluded note");
             match index.write() {
                 Ok(mut idx) => idx.add_excluded_file(&relative),
@@ -374,6 +420,21 @@ fn process_event(
     }
 
     if absolute.exists() {
+        // unchanged-skip guard: size+mtime 短路（第二道防线，切断 read->event->reindex 自反馈）
+        // debouncer-mini 0.7 擦平 EventKind，读文件产生的 OPEN 与真实修改无法区分，
+        // 只能以文件签名 (size, modified) 判定是否有实质变化；签名未变则跳过（不读文件、不入队）。
+        let current_sig = fs::file_stat(vault_root, &relative).ok().map(|st| (st.size, st.modified));
+        let previous_sig = index
+            .read()
+            .ok()
+            .and_then(|idx| idx.get_note(&relative).map(|meta| (meta.stat.size, meta.stat.modified)));
+        if let (Some(cur), Some(prev)) = (current_sig, previous_sig)
+            && cur == prev
+        {
+            tracing::trace!(path = %relative.display(), "watcher event skipped: file signature unchanged");
+            return false;
+        }
+
         tracing::debug!(path = %relative.display(), "reindexing (create/modify)");
         let meta = match index.write() {
             Ok(mut idx) => {

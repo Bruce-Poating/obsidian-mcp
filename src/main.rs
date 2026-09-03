@@ -97,8 +97,20 @@ async fn serve_http(
     let mut mcp_config = StreamableHttpServerConfig::default();
     mcp_config.stateful_mode = true;
     mcp_config.json_response = true;
+    // mcp-gateway 3.5.0 chokes on rmcp's empty priming keepalive frame
+    // ("data: \nid: 0\nretry: 3000") preceding every POST response stream:
+    // it parses each data: payload as JSON-RPC and throws on the empty one.
+    // sse_retry=None suppresses the priming event entirely (rmcp local.rs L92,
+    // tower.rs L945/L1142), so the first data: frame is the real JSON-RPC reply.
+    mcp_config.sse_retry = None;
 
     let health_vault = vault.clone();
+    let mut session_manager = LocalSessionManager::default();
+    // The session layer has its own sse_retry (SessionConfig, default 3s) that
+    // prepends the same empty priming frame on request-wise streams (tools/call);
+    // None = first data: frame is the JSON-RPC reply itself.
+    session_manager.session_config.sse_retry = None;
+
     let mcp_service: StreamableHttpService<ObsidianMcp, LocalSessionManager> =
         StreamableHttpService::new(
             move || {
@@ -115,7 +127,7 @@ async fn serve_http(
                     disabled,
                 ))
             },
-            Arc::new(LocalSessionManager::default()),
+            Arc::new(session_manager),
             mcp_config,
         );
 

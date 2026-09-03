@@ -983,66 +983,103 @@ fn embed_batch_api(
     api_key: &str,
     texts: &[&str],
 ) -> Result<Vec<Vec<f32>>, VaultError> {
-    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
-    let body = serde_json::json!({
-        "model": model,
-        "input": texts,
-        "encoding_format": "float",
-    });
-
+    // The runtime reconciler batches up to RECONCILE_BATCH_SIZE (32) notes into
+    // one embed_batch() call, but OpenAI-compatible providers enforce per-request
+    // limits. Volcengine Ark rejects requests with more than 10 input items or a
+    // single item above 100_000 bytes (HTTP 400 InvalidParameter), and a rejected
+    // request fails the whole runtime batch — every note is silently requeued and
+    // the cold-start reconcile wedges. Slice requests to stay within those limits.
+    const API_MAX_ITEMS: usize = 10;
+    const API_MAX_ITEM_BYTES: usize = 100_000;
     const MAX_RETRIES: u8 = 3;
-    let mut attempt = 0u8;
-    loop {
-        let response = client
-            .post(&url)
-            .header("Authorization", format!("Bearer {api_key}"))
-            .json(&body)
-            .send()
-            .map_err(|error| {
-                let detail = if error.is_timeout() {
-                    "request timed out"
-                } else if error.is_connect() {
-                    "connection failed"
-                } else if error.is_builder() {
-                    "request could not be constructed"
-                } else {
-                    "request failed"
-                };
-                VaultError::Embedding(format!("embedding API {detail}"))
+
+    let url = format!("{}/embeddings", base_url.trim_end_matches('/'));
+    let mut vectors: Vec<Vec<f32>> = Vec::with_capacity(texts.len());
+    for chunk in texts.chunks(API_MAX_ITEMS) {
+        let input: Vec<&str> = chunk
+            .iter()
+            .map(|text| truncate_utf8_bytes(text, API_MAX_ITEM_BYTES))
+            .collect();
+        let body = serde_json::json!({
+            "model": model,
+            "input": input,
+            "encoding_format": "float",
+        });
+
+        let mut attempt = 0u8;
+        loop {
+            let response = client
+                .post(&url)
+                .header("Authorization", format!("Bearer {api_key}"))
+                .json(&body)
+                .send()
+                .map_err(|error| {
+                    let detail = if error.is_timeout() {
+                        "request timed out"
+                    } else if error.is_connect() {
+                        "connection failed"
+                    } else if error.is_builder() {
+                        "request could not be constructed"
+                    } else {
+                        "request failed"
+                    };
+                    VaultError::Embedding(format!("embedding API {detail}"))
+                })?;
+
+            let status = response.status();
+            if status.as_u16() == 429 && attempt < MAX_RETRIES {
+                let wait = response
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|v| v.parse::<u64>().ok())
+                    .unwrap_or(1u64 << attempt)
+                    .min(30);
+                attempt += 1;
+                tracing::warn!(
+                    retry_after_secs = wait,
+                    attempt = attempt,
+                    max_retries = MAX_RETRIES,
+                    "embedding API rate limited (attempt {attempt}/{MAX_RETRIES})"
+                );
+                std::thread::sleep(std::time::Duration::from_secs(wait));
+                continue;
+            }
+
+            if !status.is_success() {
+                tracing::warn!(
+                    status = %status,
+                    "embedding API request failed"
+                );
+                return Err(VaultError::Embedding(format!(
+                    "embedding API returned HTTP status {status}"
+                )));
+            }
+
+            let resp: serde_json::Value = response.json().map_err(|_| {
+                VaultError::Embedding("embedding API returned invalid JSON".to_string())
             })?;
 
-        let status = response.status();
-        if status.as_u16() == 429 && attempt < MAX_RETRIES {
-            let wait = response
-                .headers()
-                .get("retry-after")
-                .and_then(|v| v.to_str().ok())
-                .and_then(|v| v.parse::<u64>().ok())
-                .unwrap_or(1u64 << attempt)
-                .min(30);
-            attempt += 1;
-            tracing::warn!(
-                retry_after_secs = wait,
-                attempt = attempt,
-                max_retries = MAX_RETRIES,
-                "embedding API rate limited (attempt {attempt}/{MAX_RETRIES})"
-            );
-            std::thread::sleep(std::time::Duration::from_secs(wait));
-            continue;
+            vectors.append(&mut parse_embedding_response(&resp, chunk.len())?);
+            break;
         }
-
-        if !status.is_success() {
-            return Err(VaultError::Embedding(format!(
-                "embedding API returned HTTP status {status}"
-            )));
-        }
-
-        let resp: serde_json::Value = response.json().map_err(|_| {
-            VaultError::Embedding("embedding API returned invalid JSON".to_string())
-        })?;
-
-        return parse_embedding_response(&resp, texts.len());
     }
+    Ok(vectors)
+}
+
+/// Truncate a note to at most `max_bytes` without splitting a UTF-8 character.
+/// Oversized notes are embedded on their leading content; the alternative —
+/// failing the whole request batch — would starve the reconcile loop.
+#[cfg(feature = "embeddings-api")]
+fn truncate_utf8_bytes(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
 }
 
 /// Parse an OpenAI-compatible embedding API response into embedding vectors.

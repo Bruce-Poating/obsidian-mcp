@@ -101,8 +101,9 @@ impl ObsidianMcp {
                 count = disabled_tools.len(),
                 "disabling tools per filter config"
             );
-            for name in disabled_tools {
-                tool_router.disable_route(name);
+            for name in &disabled_tools {
+                tracing::info!(tool = %name, "tool disabled");
+                tool_router.disable_route(name.clone());
             }
         }
         Self {
@@ -348,7 +349,12 @@ impl ObsidianMcp {
     }
 }
 
-#[tool_handler]
+// lee fix: the default #[tool_handler] wiring calls Self::tool_router() (a
+// freshly-built static router) inside the generated list_tools/call_tool, so any
+// disable_route() applied to the instance field in new() was silently ignored
+// (upstream OBSIDIAN_TOOLS filter was dead code). Bind the generated handlers to
+// the instance field instead — this is the documented rmcp pattern.
+#[tool_handler(router = self.tool_router)]
 impl ServerHandler for ObsidianMcp {
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())

@@ -56,7 +56,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
 
     let vault = Vault::open(&config).await?;
+
+    // lee: derive tool availability from runtime config, not just the explicit
+    // OBSIDIAN_TOOLS filter. search_semantic is meaningless without embeddings
+    // (the tool would only ever return an error), and open_in_obsidian shells
+    // out to the obsidian:// protocol which cannot work on a headless server —
+    // hide both unless explicitly re-enabled.
     let disabled_tools = config.tool_filter.disabled_tools();
+    let disabled_tools: HashSet<String> = {
+        let mut set = disabled_tools;
+        if !config.embeddings {
+            set.insert("search_semantic".to_string());
+            tracing::info!("search_semantic hidden: OBSIDIAN_EMBEDDINGS is disabled");
+        }
+        if !std::env::var("OBSIDIAN_ENABLE_OPEN_IN_OBSIDIAN")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+        {
+            set.insert("open_in_obsidian".to_string());
+        }
+        set
+    };
 
     match config.transport {
         Transport::Stdio => {
